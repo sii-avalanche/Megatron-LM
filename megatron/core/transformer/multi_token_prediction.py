@@ -772,6 +772,8 @@ def process_mtp_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
     input_ids: Optional[Tensor] = None,
+    loss_processor: Optional[Callable[..., tuple[Tensor, Tensor, Tensor]]] = None,
+    loss_processor_context: Optional[object] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -797,6 +799,9 @@ def process_mtp_loss(
             ``labels`` is None (e.g. RL training), by rolling left to match the SFT
             label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
             is provided.
+        loss_processor (Optional[Callable]): Optional memory-efficient loss processor.
+            It returns per-token loss, acceptance correct count, and acceptance total.
+        loss_processor_context (Optional[object]): Context forwarded to ``loss_processor``.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -838,13 +843,6 @@ def process_mtp_loss(
     original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
@@ -852,7 +850,31 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        if loss_processor is None:
+            mtp_logits, _ = output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            if is_training:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
+                )
+        else:
+            mtp_loss, correct, total = loss_processor(
+                hidden_states=hidden_states_list[mtp_layer_number + 1],
+                output_layer=output_layer,
+                output_weight=output_weight,
+                labels=mtp_labels,
+                loss_mask=loss_mask,
+                runtime_gather_output=runtime_gather_output,
+                config=config,
+                context=loss_processor_context,
+                is_mtp=True,
+            )
 
         mtp_loss = loss_mask * mtp_loss
 
@@ -860,10 +882,6 @@ def process_mtp_loss(
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
-            )
-
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 mtp_loss_for_log,
                 correct,
