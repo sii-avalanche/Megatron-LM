@@ -366,9 +366,15 @@ def is_te_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
 
+    te_version = get_te_version()
+    # CPU/hybrid optimizer paths use the precision-aware interface but do not
+    # require Transformer Engine to be installed.  Treat a missing TE version
+    # as an unsatisfied optional-version check instead of comparing None.
+    if te_version is None:
+        return False
     if check_equality:
-        return get_te_version() >= PkgVersion(version)
-    return get_te_version() > PkgVersion(version)
+        return te_version >= PkgVersion(version)
+    return te_version > PkgVersion(version)
 
 
 def get_torch_version():

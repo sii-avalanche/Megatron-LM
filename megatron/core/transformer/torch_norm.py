@@ -23,9 +23,8 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ):
-        assert (
-            not config.layernorm_zero_centered_gamma
-        ), f"zero_centered_gamma not supported by torch LayerNorm"
+        if config.layernorm_zero_centered_gamma:
+            return _ZeroCenteredNorm(hidden_size, eps, config.normalization)
 
         assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
@@ -49,6 +48,29 @@ class WrappedTorchNorm:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
         return norm_cls(normalized_shape=hidden_size, eps=eps)
+
+
+class _ZeroCenteredNorm(torch.nn.Module):
+    """Torch norm equivalent of Megatron's zero-centered gamma convention."""
+
+    def __init__(self, hidden_size, eps, normalization):
+        super().__init__()
+        self.normalized_shape = (hidden_size,)
+        self.eps = eps
+        self.normalization = normalization
+        self.weight = torch.nn.Parameter(torch.zeros(hidden_size))
+        self.bias = (
+            torch.nn.Parameter(torch.zeros(hidden_size)) if normalization == "LayerNorm" else None
+        )
+
+    def forward(self, x):
+        # Megatron stores gamma around zero and adds one at use time.
+        weight = self.weight + 1
+        if self.normalization == "LayerNorm":
+            return torch.nn.functional.layer_norm(
+                x, self.normalized_shape, weight, self.bias, self.eps
+            )
+        return torch.nn.functional.rms_norm(x, self.normalized_shape, weight, self.eps)
 
 
 class L2Norm(torch.nn.Module):

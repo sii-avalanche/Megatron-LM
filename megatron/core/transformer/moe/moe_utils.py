@@ -21,6 +21,11 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api
 
+# Keep optional Transformer Engine symbols defined when TE is unavailable.  The
+# router's autograd function intentionally falls back to torch.mm/addmm in
+# that case, but the symbol must still exist for the runtime check below.
+te_general_gemm = None
+
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
